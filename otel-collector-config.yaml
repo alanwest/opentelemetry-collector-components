@@ -1,0 +1,32 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+
+connectors:
+  newrelicapm:
+
+processors:
+  newrelicapm:
+  batch:
+
+exporters:
+  otlp:
+    endpoint: http://staging-otlp.nr-data.net:4317
+    headers:
+      api-key: $NEW_RELIC_LICENSE_KEY
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [newrelicapm, batch]
+      exporters: [newrelicapm, otlp]
+    metrics:
+      receivers: [newrelicapm]
+      processors: [batch]
+      exporters: [otlp]
+    logs:
+      receivers: [newrelicapm]
+      processors: [batch]
+      exporters: [otlp]
