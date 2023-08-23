@@ -3,6 +3,8 @@ FROM golang:1.20 as builder
 WORKDIR /build
 
 COPY go.mod go.sum ./
+COPY connector/apmconnector ./connector/apmconnector
+COPY processor/apmprocessor ./processor/apmprocessor
 COPY receiver/nopreceiver ./receiver/nopreceiver
 RUN go mod download -x
 

@@ -4,9 +4,9 @@
 package apmprocessor // import "apmprocessor"
 
 import (
-	"apmprocessor/internal/metadata"
 	"context"
 
+	"github.com/newrelic/opentelemetry-collector-components/processor/apmprocessor/internal/metadata"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/processor"
