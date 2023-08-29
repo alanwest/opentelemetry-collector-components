@@ -4,8 +4,11 @@
 package apmconnector // import "github.com/newrelic/opentelemetry-collector-components/connector/apmconnector"
 
 import (
+	"context"
 	"crypto"
 	"fmt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"sort"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -41,9 +44,10 @@ func (meterProvider *MeterProvider) getOrCreateResourceMetrics(attributes pcommo
 	return rm
 }
 
-func (resourceMetrics ResourceMetrics) RecordHistogramFromSpan(metricName string, attributes pcommon.Map,
-	span ptrace.Span) pmetric.HistogramDataPoint {
-	return resourceMetrics.RecordHistogram(metricName, attributes, span.StartTimestamp(), span.EndTimestamp(), (span.EndTimestamp() - span.StartTimestamp()).AsTime().UnixNano())
+func (resourceMetrics ResourceMetrics) RecordHistogramFromSpan(transaction *Transaction, metricName string, attributes []attribute.KeyValue,
+	span ptrace.Span) {
+	histogram, _ := transaction.apmMeter.Int64Histogram(metricName)
+	histogram.Record(context.Background(), (span.EndTimestamp() - span.StartTimestamp()).AsTime().UnixNano(), metric.WithAttributes(attributes...))
 }
 
 func (resourceMetrics ResourceMetrics) RecordHistogram(metricName string, attributes pcommon.Map,

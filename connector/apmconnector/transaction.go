@@ -4,11 +4,19 @@
 package apmconnector // import "github.com/newrelic/opentelemetry-collector-components/connector/apmconnector"
 
 import (
+	"context"
 	"fmt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 type TransactionType string
@@ -63,6 +71,7 @@ type Transaction struct {
 	resourceMetrics     *ResourceMetrics
 	Measurements        map[string]*Measurement
 	sqlParser           *SQLParser
+	apmMeter            metric.Meter
 	apdex               Apdex
 	RootSpan            ptrace.Span
 }
@@ -70,20 +79,58 @@ type Transaction struct {
 type Measurement struct {
 	SpanID, MetricName, MetricTimesliceName string
 	DurationNanos, ExclusiveDurationNanos   int64
-	Attributes                              pcommon.Map
+	Attributes                              []attribute.KeyValue
 	SegmentNameProvider                     func(TransactionType) string
 	// FIXME
 	Span ptrace.Span
 }
 
 type TransactionsMap struct {
-	sqlParser    *SQLParser
-	apdex        Apdex
-	Transactions map[string]*Transaction
+	meterProvider metric.MeterProvider
+	apmMeter      metric.Meter
+	sqlParser     *SQLParser
+	apdex         Apdex
+	Transactions  map[string]*Transaction
 }
 
 func NewTransactionsMap(apdexT float64) *TransactionsMap {
-	return &TransactionsMap{Transactions: make(map[string]*Transaction), sqlParser: NewSQLParser(), apdex: NewApdex(apdexT)}
+	mp := newMeterProvider()
+	meter := mp.Meter("NewRelic.Apm")
+	return &TransactionsMap{
+		Transactions:  make(map[string]*Transaction),
+		sqlParser:     NewSQLParser(),
+		apdex:         NewApdex(apdexT),
+		meterProvider: mp,
+		apmMeter:      meter,
+	}
+}
+
+func newRelicTemporalitySelector(kind sdkmetric.InstrumentKind) metricdata.Temporality {
+	if kind == sdkmetric.InstrumentKindUpDownCounter || kind == sdkmetric.InstrumentKindObservableUpDownCounter {
+		return metricdata.CumulativeTemporality
+	}
+	return metricdata.DeltaTemporality
+}
+
+func newMeterProvider() metric.MeterProvider {
+	ctx := context.Background()
+
+	exp, err := otlpmetricgrpc.New(
+		ctx,
+		otlpmetricgrpc.WithTemporalitySelector(newRelicTemporalitySelector),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(
+			sdkmetric.NewPeriodicReader(
+				exp,
+				sdkmetric.WithInterval(5*time.Second),
+			)))
+
+	return mp
 }
 
 func (transactions *TransactionsMap) ProcessTransactions() {
@@ -112,8 +159,14 @@ func (transactions *TransactionsMap) GetOrCreateTransaction(sdkLanguage string, 
 	key := GetTransactionKey(traceID, resourceAttributes)
 	transaction, txExists := transactions.Transactions[key]
 	if !txExists {
-		transaction = &Transaction{SdkLanguage: sdkLanguage, SpanToChildDuration: make(map[string]int64),
-			resourceMetrics: resourceMetrics, Measurements: make(map[string]*Measurement), sqlParser: transactions.sqlParser, apdex: transactions.apdex}
+		transaction = &Transaction{
+			SdkLanguage:         sdkLanguage,
+			SpanToChildDuration: make(map[string]int64),
+			resourceMetrics:     resourceMetrics,
+			Measurements:        make(map[string]*Measurement),
+			sqlParser:           transactions.sqlParser,
+			apmMeter:            transactions.apmMeter,
+			apdex:               transactions.apdex}
 		transactions.Transactions[key] = transaction
 		//fmt.Printf("Created transaction for: %s   %s\n", traceID, transaction.sdkLanguage)
 	}
@@ -166,7 +219,7 @@ func NewSimpleNameProvider(name string) func(TransactionType) string {
 func (transaction *Transaction) AddMeasurement(measurement *Measurement) {
 	transaction.Measurements[measurement.SpanID] = measurement
 	measurement.ExclusiveDurationNanos = measurement.ExclusiveTime(transaction)
-	measurement.Attributes.PutStr("metricTimesliceName", measurement.MetricTimesliceName)
+	measurement.Attributes = append(measurement.Attributes, attribute.String("metricTimesliceName", measurement.MetricTimesliceName))
 }
 
 func (transaction *Transaction) ProcessDatabaseSpan(span ptrace.Span) bool {
@@ -182,14 +235,13 @@ func (transaction *Transaction) ProcessDatabaseSpan(span ptrace.Span) bool {
 	if !dbTablePresent {
 		dbTable = pcommon.NewValueStr("unknown")
 	}
-	attributes := pcommon.NewMap()
-	attributes.EnsureCapacity(10)
-	attributes.PutStr(DbOperationAttributeName, dbOperation.AsString())
-	attributes.PutStr(DbSystemAttributeName, dbSystem.AsString())
-	attributes.PutStr(DbSQLTableAttributeName, dbTable.AsString())
+	var attributes []attribute.KeyValue
+	attributes = append(attributes, attribute.String(DbOperationAttributeName, dbOperation.AsString()))
+	attributes = append(attributes, attribute.String(DbSystemAttributeName, dbSystem.AsString()))
+	attributes = append(attributes, attribute.String(DbSQLTableAttributeName, dbTable.AsString()))
 	for _, key := range []string{"net.peer.name", "db.name"} {
 		if value, exists := span.Attributes().Get(key); exists {
-			attributes.PutStr(key, value.AsString())
+			attributes = append(attributes, attribute.String(key, value.AsString()))
 		}
 	}
 
@@ -205,10 +257,10 @@ func (transaction *Transaction) ProcessDatabaseSpan(span ptrace.Span) bool {
 func (transaction *Transaction) ProcessExternalSpan(span ptrace.Span) bool {
 	serverAddress, serverAddressKey := GetFirst(span.Attributes(), []string{"server.address", "net.peer.name"})
 	if serverAddressKey != "" {
-		attributes := pcommon.NewMap()
-		attributes.PutStr("server.address", serverAddress.AsString())
+		var attributes []attribute.KeyValue
+		attributes = append(attributes, attribute.String("server.address", serverAddress.AsString()))
 		// FIXME remove after UI is updated
-		attributes.PutStr("external.host", serverAddress.AsString())
+		attributes = append(attributes, attribute.String("external.host", serverAddress.AsString()))
 
 		segmentNameProvider := func(t TransactionType) string {
 			switch t {
@@ -229,7 +281,7 @@ func (transaction *Transaction) ProcessExternalSpan(span ptrace.Span) bool {
 }
 
 func (transaction *Transaction) ProcessGenericSpan(span ptrace.Span) bool {
-	attributes := pcommon.NewMap()
+	var attributes []attribute.KeyValue
 	timesliceName := fmt.Sprintf("Custom/%s", span.Name())
 	measurement := Measurement{SpanID: span.SpanID().String(), MetricName: "newrelic.timeslice.value", Span: span,
 		DurationNanos: DurationInNanos(span), Attributes: attributes, SegmentNameProvider: NewSimpleNameProvider(transaction.SdkLanguage), MetricTimesliceName: timesliceName}
@@ -278,27 +330,26 @@ func (transaction *Transaction) ProcessRootSpan() bool {
 	overviewMetricName := transactionType.GetOverviewMetricName()
 
 	for segment, sum := range breakdownBySegment {
-		attributes := pcommon.NewMap()
-		attributes.PutStr("segmentName", segment)
+		var attributes []attribute.KeyValue
+		attributes = append(attributes, attribute.String("segmentName", segment))
 
-		transaction.resourceMetrics.RecordHistogram(overviewMetricName, attributes,
-			span.StartTimestamp(), span.EndTimestamp(), sum)
+		histogram, _ := transaction.apmMeter.Int64Histogram(overviewMetricName)
+		histogram.Record(context.Background(), sum, metric.WithAttributes(attributes...))
 	}
 
 	{
-		attributes := pcommon.NewMap()
-		attributes.PutStr("transactionType", transactionType.AsString())
-		attributes.PutStr("transactionName", transactionName)
-		attributes.PutStr("metricTimesliceName", transactionName)
+		var attributes []attribute.KeyValue
+		attributes = append(attributes, attribute.String("transactionType", transactionType.AsString()))
+		attributes = append(attributes, attribute.String("transactionName", transactionName))
+		attributes = append(attributes, attribute.String("metricTimesliceName", transactionName))
 
-		transaction.resourceMetrics.RecordHistogramFromSpan("apm.service.transaction.duration", attributes, span)
+		transaction.resourceMetrics.RecordHistogramFromSpan(transaction, "apm.service.transaction.duration", attributes, span)
 
-		attributes.PutStr("transactionName", transactionName)
+		attributes = append(attributes, attribute.String("transactionName", transactionName))
 
 		// blame any time not attributed to measurements to the transaction itself
-		transaction.resourceMetrics.RecordHistogram("apm.service.transaction.overview", attributes,
-			span.StartTimestamp(), span.EndTimestamp(), remainingNanos)
-
+		histogram, _ := transaction.apmMeter.Int64Histogram("apm.service.transaction.overview")
+		histogram.Record(context.Background(), remainingNanos, metric.WithAttributes(attributes...))
 	}
 
 	return true
@@ -337,19 +388,22 @@ func (transaction *Transaction) IncrementErrorCount(transactionName string, tran
 }
 
 func (transaction *Transaction) ProcessMeasurement(measurement *Measurement, transactionType TransactionType, transactionName string) {
-	measurement.Attributes.PutStr("transactionType", transactionType.AsString())
-	measurement.Attributes.PutStr("scope", transactionName)
+	measurement.Attributes = append(measurement.Attributes, attribute.String("transactionType", transactionType.AsString()))
+	measurement.Attributes = append(measurement.Attributes, attribute.String("scope", transactionName))
 
-	transaction.resourceMetrics.RecordHistogramFromSpan(measurement.MetricName, measurement.Attributes, measurement.Span)
+	transaction.resourceMetrics.RecordHistogramFromSpan(transaction, measurement.MetricName, measurement.Attributes, measurement.Span)
 
 	{
-		attributes := pcommon.NewMap()
-		measurement.Attributes.CopyTo(attributes)
 		// we might not need transactionName here..
-		attributes.PutStr("transactionName", transactionName)
+		measurement.Attributes = append(measurement.Attributes, attribute.String("transactionName", transactionName))
 
-		transaction.resourceMetrics.RecordHistogram("apm.service.transaction.overview", attributes,
-			measurement.Span.StartTimestamp(), measurement.Span.EndTimestamp(), measurement.ExclusiveDurationNanos)
+		transactionOverview, err := transaction.apmMeter.
+			Int64Histogram("apm.service.transaction.overview")
+		if err != nil {
+			panic(err.Error())
+		}
+
+		transactionOverview.Record(context.Background(), measurement.ExclusiveDurationNanos, metric.WithAttributes(measurement.Attributes...))
 	}
 }
 
